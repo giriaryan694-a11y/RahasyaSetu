@@ -1,0 +1,6 @@
+PyQt6>=6.6.0 
+Pillow>=10.0.0
+pycryptodome>=3.19.0 
+mutagen>=1.46.0 
+moviepy>=2.0.0 
+numpy>=1.26.0
