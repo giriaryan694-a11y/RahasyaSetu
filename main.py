@@ -98,8 +98,6 @@ def encrypt_bytes(plain: bytes, password: str):
     iv = get_random_bytes(AES_NONCE_BYTES)
     cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
     ct, tag = cipher.encrypt_and_digest(plain)
-    # store salt + iv + tag + ciphertext as data (tag included inside returned payload or in header)
-    # We'll keep salt & iv in header, and return ciphertext+tag
     return {'cipher': ct + tag, 'salt': salt, 'iv': iv}
 
 def decrypt_bytes(cipher_and_tag: bytes, password: str, salt: bytes, iv: bytes):
@@ -117,7 +115,6 @@ def decrypt_bytes(cipher_and_tag: bytes, password: str, salt: bytes, iv: bytes):
 def capacity_for_image(path):
     img = Image.open(path)
     w,h = img.size
-    # we'll use 3 channels (RGB) to be safe
     return w * h * 3 // 8  # bytes
 
 def embed_image_lsb(carrier_path, payload_bytes, out_path, progress_callback=None):
@@ -171,7 +168,6 @@ def capacity_for_wav(path):
     with wave.open(path, 'rb') as wf:
         nframes = wf.getnframes()
         sampwidth = wf.getsampwidth()
-        # we'll embed 1 bit per byte of audio frame
         return (nframes * sampwidth) // 8
 
 def embed_wav_lsb(carrier_path, payload_bytes, out_path, progress_callback=None):
@@ -211,7 +207,6 @@ def embed_mp3_id3(carrier_path, payload_bytes, out_path):
         tags = ID3(carrier_path)
     except ID3NoHeaderError:
         tags = ID3()
-    # Add APIC frame storing binary payload (use description to identify)
     frame = APIC(encoding=3, mime='application/octet-stream', type=3, desc='RahasyaSetu', data=payload_bytes)
     tags.add(frame)
     tags.save(out_path)
@@ -233,7 +228,6 @@ def append_method(carrier_path, payload_bytes, out_path):
         f.write(c)
         f.write(payload_bytes)
 
-# MP4 embedding using moviepy (frame LSB)
 def capacity_for_mp4(path):
     clip = VideoFileClip(path)
     w,h = clip.size
@@ -241,7 +235,6 @@ def capacity_for_mp4(path):
     nframes = int(clip.duration * fps)
     clip.reader.close()
     clip.audio = None
-    # capacity in bytes: frames * pixels * 3 bits / 8
     return (nframes * w * h * 3) // 8
 
 def embed_mp4_frames(carrier_path, payload_bytes, out_path, progress_callback=None):
@@ -254,16 +247,12 @@ def embed_mp4_frames(carrier_path, payload_bytes, out_path, progress_callback=No
     if total_bits > cap_bits:
         clip.reader.close()
         raise ValueError("Payload too large for video carrier (capacity {} bytes)".format(cap_bits//8))
-
     bitstr = ''.join(f'{b:08b}' for b in payload_bytes)
     bit_iter = iter(bitstr)
-
     def process_frame(frame):
-        # frame: numpy array HxWx3 (RGB)
         nonlocal bit_iter
         h_ = frame.shape[0]; w_ = frame.shape[1]
         flat = frame.reshape(-1, 3)
-        # modify LSBs of R,G,B sequentially for as many bits as available in this frame
         for i in range(flat.shape[0]):
             for ch in range(3):
                 try:
@@ -272,11 +261,7 @@ def embed_mp4_frames(carrier_path, payload_bytes, out_path, progress_callback=No
                     return frame
                 flat[i, ch] = (int(flat[i, ch]) & 0xFE) | int(b)
         return flat.reshape(h_, w_, 3)
-
-    # Use fl_image to apply function to all frames; this will iterate frames and call process_frame
-    # But fl_image expects a function that returns a frame for each input. We'll keep iter state globally.
     new_clip = clip.fl_image(process_frame)
-    # write new video (may take time)
     new_clip.write_videofile(out_path, codec='libx264', audio_codec='aac', verbose=False, logger=None)
     clip.reader.close()
     if progress_callback:
@@ -319,11 +304,9 @@ class Worker(QThread):
         self.out_path = out_path
         self.mode = mode
         self.password = password
-
     def run(self):
         try:
             if self.mode == 'hide':
-                # read payload
                 with open(self.payload_path, 'rb') as f:
                     payload_data = f.read()
                 encrypted = False
@@ -333,13 +316,9 @@ class Worker(QThread):
                     payload_data = enc['cipher']  # ciphertext + tag
                     salt = enc['salt']; iv = enc['iv']
                     encrypted = True
-                # prepare header + payload
                 header = make_header(os.path.basename(self.payload_path), len(payload_data), encrypted, salt, iv)
                 payload_container = header + payload_data
-
-                # detect carrier type
                 ext = os.path.splitext(self.carrier_path)[1].lower().strip('.')
-                # capacity check
                 if ext in ('png','jpg','jpeg','bmp'):
                     cap = capacity_for_image(self.carrier_path)
                     if len(payload_container) > cap:
@@ -355,7 +334,6 @@ class Worker(QThread):
                     self.finished.emit(f'Embedded into WAV: {self.out_path}')
                     return
                 elif ext == 'mp3':
-                    # ID3v2 APIC embedding
                     embed_bytes = payload_container
                     embed_mp3_id3(self.carrier_path, embed_bytes, self.out_path)
                     self.progress.emit(100)
@@ -369,23 +347,17 @@ class Worker(QThread):
                     self.finished.emit(f'Embedded into MP4 frames: {self.out_path}')
                     return
                 else:
-                    # fallback: append
                     append_method(self.carrier_path, payload_container, self.out_path)
                     self.progress.emit(100)
                     self.finished.emit(f'Appended payload to file EOF: {self.out_path}')
                     return
-
             else:  # extract
                 ext = os.path.splitext(self.carrier_path)[1].lower().strip('.')
                 raw = None
                 if ext in ('png','jpg','jpeg','bmp'):
-                    # read first chunk of bytes via LSB to get header length guess: header length unknown, but header is small
-                    # we'll first read first 512 bytes to parse header
                     sample_head = extract_image_lsb(self.carrier_path, 512, progress_callback=None)
                     hdr = parse_header(sample_head, 0)
                     if not hdr:
-                        # fallback: try searching appended marker at EOF
-                        # read entire file bytes and search
                         with open(self.carrier_path, 'rb') as f: data=f.read()
                         idx = data.rfind(MAGIC)
                         if idx == -1:
@@ -395,11 +367,9 @@ class Worker(QThread):
                         if not hdr:
                             self.finished.emit('Header parse failed.')
                             return
-                        # get payload bytes following header from append
                         payload_bytes = data[idx + hdr['header_len']: idx + hdr['header_len'] + hdr['payload_len']]
                         raw = payload_bytes
                     else:
-                        # got header from LSB first chunk
                         payload_total = hdr['header_len'] + hdr['payload_len']
                         data_all = extract_image_lsb(self.carrier_path, payload_total, progress_callback=self.progress.emit)
                         hdr2 = parse_header(data_all, 0)
@@ -409,11 +379,9 @@ class Worker(QThread):
                         raw = data_all[hdr2['header_len'] : hdr2['header_len'] + hdr2['payload_len']]
                         hdr = hdr2
                 elif ext == 'wav':
-                    # similar approach: read initial bytes via LSB to parse header
                     sample_head = extract_wav_lsb(self.carrier_path, 512, progress_callback=None)
                     hdr = parse_header(sample_head, 0)
                     if not hdr:
-                        # fallback: search appended EOF marker
                         with open(self.carrier_path, 'rb') as f: data=f.read()
                         idx = data.rfind(MAGIC)
                         if idx == -1:
@@ -434,7 +402,6 @@ class Worker(QThread):
                 elif ext == 'mp3':
                     data = extract_mp3_id3(self.carrier_path)
                     if not data:
-                        # fallback: try appended EOF
                         with open(self.carrier_path, 'rb') as f: d=f.read(); idx = d.rfind(MAGIC)
                         if idx == -1:
                             self.finished.emit('No RahasyaSetu data found in MP3.')
@@ -448,8 +415,37 @@ class Worker(QThread):
                             return
                         raw = data[hdr['header_len']: hdr['header_len'] + hdr['payload_len']]
                 elif ext in ('mp4','mov','m4v'):
-                    # try LSB frame extraction: first read small head
                     sample_head = extract_mp4_frames(self.carrier_path, 512, progress_callback=None)
                     hdr = parse_header(sample_head, 0)
                     if not hdr:
-                        # fallback 
+                        with open(self.carrier_path, 'rb') as f: d=f.read(); idx = d.rfind(MAGIC)
+                        if idx == -1:
+                            self.finished.emit('No RahasyaSetu header found in MP4.')
+                            return
+                        hdr = parse_header(d, idx)
+                        raw = d[idx + hdr['header_len']: idx + hdr['header_len'] + hdr['payload_len']]
+                    else:
+                        payload_total = hdr['header_len'] + hdr['payload_len']
+                        data_all = extract_mp4_frames(self.carrier_path, payload_total, progress_callback=self.progress.emit)
+                        hdr2 = parse_header(data_all, 0)
+                        if not hdr2:
+                            self.finished.emit('Header parse failed after reading MP4 LSB.')
+                            return
+                        raw = data_all[hdr2['header_len']: hdr2['header_len'] + hdr2['payload_len']]
+                        hdr = hdr2
+                else:
+                    with open(self.carrier_path, 'rb') as f:
+                        d = f.read()
+                    idx = d.rfind(MAGIC)
+                    if idx == -1:
+                        self.finished.emit('No RahasyaSetu marker found in file.')
+                        return
+                    hdr = parse_header(d, idx)
+                    raw = d[idx + hdr['header_len']: idx + hdr['header_len'] + hdr['payload_len']]
+                if hdr is None or raw is None:
+                    self.finished.emit('Failed to recover header or payload.')
+                    return
+                if hdr['encrypted']:
+                    if not self.password:
+                        self.finished.emit('Payload is encrypted — provide password to decrypt.')
+                   
