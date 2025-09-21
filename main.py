@@ -448,4 +448,167 @@ class Worker(QThread):
                 if hdr['encrypted']:
                     if not self.password:
                         self.finished.emit('Payload is encrypted — provide password to decrypt.')
-                   
+                        return
+                    try:
+                        plain = decrypt_bytes(raw, self.password, hdr['salt'], hdr['iv'])
+                    except Exception as e:
+                        self.finished.emit('Decryption failed: ' + str(e))
+                        return
+                else:
+                    plain = raw
+                with open(self.out_path, 'wb') as outf:
+                    outf.write(plain)
+                self.progress.emit(100)
+                self.finished.emit(f'Extracted payload saved to: {self.out_path} (orig name: {hdr["filename"]})')
+                return
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.finished.emit('Error: ' + str(e) + '\n' + tb)
+
+# --------------------------
+# GUI (PyQt6)
+# --------------------------
+class RahasyaGUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('RahasyaSetu — Made by Aryan Giri')
+        self.setMinimumSize(720, 400)
+        self.setStyleSheet("background-color:#0b0f12; color:#b5ffcf; font-family: 'Courier New', monospace;")
+        layout = QVBoxLayout()
+
+        header = QLabel("RahasyaSetu — Local steganography client")
+        header.setFont(QFont('Courier', 18, QFont.Weight.Bold))
+        header.setStyleSheet("color:#00ffa3;")
+        layout.addWidget(header)
+
+        sub = QLabel("Hide/extract files in images, WAV, MP3 (ID3), MP4 (frames), or append. All local. Use ethically.")
+        sub.setStyleSheet("color:#9cc;")
+        layout.addWidget(sub)
+
+        row1 = QHBoxLayout()
+        self.carrier_btn = QPushButton('Choose Carrier')
+        self.carrier_btn.clicked.connect(self.choose_carrier)
+        row1.addWidget(self.carrier_btn)
+        self.carrier_label = QLabel('No carrier selected')
+        row1.addWidget(self.carrier_label)
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.payload_btn = QPushButton('Choose Payload (to hide)')
+        self.payload_btn.clicked.connect(self.choose_payload)
+        row2.addWidget(self.payload_btn)
+        self.payload_label = QLabel('No payload selected')
+        row2.addWidget(self.payload_label)
+        layout.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        self.hide_btn = QPushButton('Hide →')
+        self.hide_btn.clicked.connect(self.do_hide)
+        self.hide_btn.setStyleSheet('background:#001a00; color:#00ff9f; padding:8px;')
+        row3.addWidget(self.hide_btn)
+        self.extract_btn = QPushButton('Extract ←')
+        self.extract_btn.clicked.connect(self.do_extract)
+        self.extract_btn.setStyleSheet('background:#1a0000; color:#ffb3b3; padding:8px;')
+        row3.addWidget(self.extract_btn)
+        layout.addLayout(row3)
+
+        row4 = QHBoxLayout()
+        self.encrypt_box = QCheckBox('Encrypt payload (AES-GCM)')
+        row4.addWidget(self.encrypt_box)
+        self.pw_input = QLineEdit()
+        self.pw_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pw_input.setPlaceholderText('Password (when encrypting or decrypting)')
+        self.pw_input.setMinimumWidth(260)
+        row4.addWidget(self.pw_input)
+        layout.addLayout(row4)
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+        self.status = QLabel('Ready.')
+        self.status.setStyleSheet('color:#9bb;')
+        layout.addWidget(self.status)
+
+        hint = QLabel('You can also drag & drop a file onto the app window (carrier) to select it.')
+        hint.setStyleSheet('color:#7f8c8d; font-size:11px;')
+        layout.addWidget(hint)
+
+        self.setLayout(layout)
+        self.carrier_path = None
+        self.payload_path = None
+        self.worker = None
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+    def dropEvent(self, e):
+        urls = e.mimeData().urls()
+        if not urls:
+            return
+        path = urls[0].toLocalFile()
+        self.carrier_path = path
+        self.carrier_label.setText(os.path.basename(path))
+        self.status.setText('Carrier selected via drag & drop.')
+
+    def choose_carrier(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Choose carrier file', '', 'All files (*.*)')
+        if path:
+            self.carrier_path = path
+            self.carrier_label.setText(os.path.basename(path))
+            self.status.setText('Carrier selected: ' + path)
+
+    def choose_payload(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Choose payload file', '', 'All files (*.*)')
+        if path:
+            self.payload_path = path
+            self.payload_label.setText(os.path.basename(path))
+            self.status.setText('Payload selected: ' + path)
+
+    def do_hide(self):
+        if not self.carrier_path or not self.payload_path:
+            self.status.setText('Select both carrier and payload first.')
+            return
+        out, _ = QFileDialog.getSaveFileName(self, 'Save stego file as', os.path.basename(self.carrier_path))
+        if not out:
+            self.status.setText('Output selection cancelled.')
+            return
+        pwd = self.pw_input.text() if self.encrypt_box.isChecked() else None
+        self.worker = Worker(self.carrier_path, self.payload_path, out, mode='hide', password=pwd)
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.finished.connect(self.on_finished)
+        self.progress.setValue(0)
+        self.status.setText('Working — embedding...')
+        self.worker.start()
+
+    def do_extract(self):
+        if not self.carrier_path:
+            self.status.setText('Select carrier to extract from (or drag & drop it).')
+            return
+        out, _ = QFileDialog.getSaveFileName(self, 'Save extracted payload as', '') 
+        if not out:
+            self.status.setText('Output selection cancelled.')
+            return
+        pwd = self.pw_input.text() if self.encrypt_box.isChecked() else None
+        self.worker = Worker(self.carrier_path, None, out, mode='extract', password=pwd)
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.finished.connect(self.on_finished)
+        self.progress.setValue(0)
+        self.status.setText('Working — extracting...')
+        self.worker.start()
+
+    def on_finished(self, msg):
+        self.status.setText(msg)
+        self.progress.setValue(100)
+
+# --------------------------
+# Run
+# --------------------------
+def main():
+    app = QApplication(sys.argv)
+    gui = RahasyaGUI()
+    gui.show()
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main()
+  
